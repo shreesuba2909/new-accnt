@@ -1,0 +1,771 @@
+"""
+Azure AI Search - RAG Index Setup Automation
+============================================
+Automates the full pipeline:
+  1. Create Azure AI Search index
+  2. Enable semantic search configuration
+  3. Load and chunk commerce knowledge base documents
+  4. Upload documents to the index
+  5. Verify indexing with test queries
+
+Requirements:
+    pip install azure-search-documents azure-core openai python-dotenv tqdm
+
+Usage:
+    1. Copy .env.example to .env and fill in your credentials
+    2. Add your knowledge base documents to the /knowledge_base folder
+    3. Run: python azure_rag_setup.py
+"""
+
+import os
+import json
+import time
+import uuid
+import logging
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+from tqdm import tqdm
+
+from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import ResourceExistsError, HttpResponseError
+from azure.search.documents import SearchClient
+from azure.search.documents.indexes import SearchIndexClient
+from azure.search.documents.indexes.models import (
+    SearchIndex,
+    SearchField,
+    SearchFieldDataType,
+    SimpleField,
+    SearchableField,
+    SemanticConfiguration,
+    SemanticPrioritizedFields,
+    SemanticField,
+    SemanticSearch,
+    VectorSearch,
+    HnswAlgorithmConfiguration,
+    VectorSearchProfile,
+)
+from azure.search.documents.models import QueryType
+
+# ── Optional: embeddings via Azure OpenAI ──────────────────────────────────
+try:
+    from openai import AzureOpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+# ── Logging ────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+load_dotenv()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION  — edit .env or set environment variables
+# ══════════════════════════════════════════════════════════════════════════════
+
+AZURE_SEARCH_ENDPOINT   = os.getenv("AZURE_SEARCH_ENDPOINT")        # https://<name>.search.windows.net
+AZURE_SEARCH_ADMIN_KEY  = os.getenv("AZURE_SEARCH_ADMIN_KEY")       # admin key (not query key)
+INDEX_NAME              = os.getenv("INDEX_NAME", "commerce-schema-index")
+
+# Optional — only needed if you want vector/embedding search
+AZURE_OPENAI_ENDPOINT   = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_KEY        = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_API_VER    = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+EMBEDDING_DEPLOYMENT    = os.getenv("EMBEDDING_DEPLOYMENT", "text-embedding-ada-002")
+EMBEDDING_DIMENSIONS    = 1536   # ada-002 output size
+
+USE_VECTOR_SEARCH       = bool(AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY and OPENAI_AVAILABLE)
+
+KNOWLEDGE_BASE_DIR      = Path("knowledge_base")   # folder with your .json / .txt / .pdf docs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BUILT-IN COMMERCE KNOWLEDGE BASE
+# A rich seed dataset — augment with your own documents in /knowledge_base
+# ══════════════════════════════════════════════════════════════════════════════
+
+COMMERCE_KNOWLEDGE_BASE = [
+    # ── Customer / Identity ────────────────────────────────────────────────
+    {
+        "field_name": "customer_email",
+        "domain": "commerce",
+        "sub_domain": "customer",
+        "data_type": "VARCHAR(255)",
+        "constraints": "UNIQUE, NOT NULL, INDEX",
+        "professional_description": (
+            "Serves as the primary unique identifier and communication endpoint "
+            "for a customer account, conforming to RFC 5321 address standards. "
+            "Used across transactional notifications, authentication workflows, "
+            "and CRM integrations. Indexed for high-frequency lookup operations "
+            "during checkout, login, and marketing automation pipelines."
+        ),
+        "examples": "john.doe@company.com",
+        "related_fields": "customer_id, username, contact_phone",
+        "compliance_notes": "Subject to GDPR Article 6 processing lawfulness requirements.",
+    },
+    {
+        "field_name": "customer_id",
+        "domain": "commerce",
+        "sub_domain": "customer",
+        "data_type": "BIGINT / UUID",
+        "constraints": "PRIMARY KEY, NOT NULL, AUTO_INCREMENT",
+        "professional_description": (
+            "Surrogate primary key uniquely identifying each registered customer "
+            "entity within the commerce platform. Auto-generated at account "
+            "creation and immutable thereafter. Referenced as a foreign key across "
+            "orders, wishlists, addresses, payment methods, and audit logs to "
+            "maintain referential integrity."
+        ),
+        "examples": "10045, a3f2c1b0-...",
+        "related_fields": "email, first_name, last_name, created_at",
+        "compliance_notes": "PII anchor — deletion must cascade per right-to-erasure requests.",
+    },
+    {
+        "field_name": "customer_type",
+        "domain": "commerce",
+        "sub_domain": "customer",
+        "data_type": "ENUM / VARCHAR(50)",
+        "constraints": "NOT NULL, DEFAULT 'retail'",
+        "professional_description": (
+            "Classifies the customer account tier, distinguishing between retail "
+            "consumers, wholesale buyers, B2B partners, and VIP segments. Drives "
+            "pricing rule evaluation, discount eligibility, tax exemption logic, "
+            "and personalised catalogue visibility in multi-channel commerce setups."
+        ),
+        "examples": "retail, wholesale, b2b, vip",
+        "related_fields": "price_group_id, tax_class_id",
+        "compliance_notes": "",
+    },
+
+    # ── Product ────────────────────────────────────────────────────────────
+    {
+        "field_name": "sku",
+        "domain": "commerce",
+        "sub_domain": "product",
+        "data_type": "VARCHAR(100)",
+        "constraints": "UNIQUE, NOT NULL, INDEX",
+        "professional_description": (
+            "Stock Keeping Unit — a merchant-defined alphanumeric identifier that "
+            "uniquely distinguishes each sellable product variant within the "
+            "catalogue. Acts as the canonical reference in purchase orders, "
+            "warehouse management systems, and third-party marketplace feeds. "
+            "Must remain stable across the product lifecycle to preserve historical "
+            "order line integrity."
+        ),
+        "examples": "SHIRT-BLU-M, ELEC-TV-55-4K",
+        "related_fields": "product_id, barcode, upc",
+        "compliance_notes": "",
+    },
+    {
+        "field_name": "product_status",
+        "domain": "commerce",
+        "sub_domain": "product",
+        "data_type": "ENUM / VARCHAR(30)",
+        "constraints": "NOT NULL, DEFAULT 'draft', INDEX",
+        "professional_description": (
+            "Represents the lifecycle publication state of a product record, "
+            "controlling its visibility across storefront, API catalogue, and "
+            "search indexes. Transitions follow a defined state machine: "
+            "draft → review → active → archived. Active records are eligible "
+            "for indexing, promotions, and order placement; archived records are "
+            "retained for historical reporting only."
+        ),
+        "examples": "draft, active, discontinued, archived",
+        "related_fields": "visibility, catalog_start_date, catalog_end_date",
+        "compliance_notes": "",
+    },
+    {
+        "field_name": "msrp",
+        "domain": "commerce",
+        "sub_domain": "product",
+        "data_type": "DECIMAL(12,4)",
+        "constraints": "NULLABLE",
+        "professional_description": (
+            "Manufacturer's Suggested Retail Price — the recommended consumer "
+            "selling price set by the product manufacturer or brand. Stored at "
+            "four decimal precision to accommodate multi-currency rounding "
+            "strategies. Used as a reference ceiling for discount display logic "
+            "and comparative pricing widgets on product detail pages."
+        ),
+        "examples": "299.9900, 1499.0000",
+        "related_fields": "base_price, sale_price, cost_price",
+        "compliance_notes": "Advertised price regulations vary by jurisdiction (FTC, EU PriceDir).",
+    },
+
+    # ── Order ──────────────────────────────────────────────────────────────
+    {
+        "field_name": "order_id",
+        "domain": "commerce",
+        "sub_domain": "order",
+        "data_type": "BIGINT / UUID",
+        "constraints": "PRIMARY KEY, NOT NULL",
+        "professional_description": (
+            "Immutable surrogate key uniquely identifying a sales transaction "
+            "within the order management system. Generated at order placement "
+            "and propagated to fulfilment, payment gateway webhooks, and "
+            "customer-facing correspondence. UUID variant preferred in distributed "
+            "architectures to prevent enumeration attacks."
+        ),
+        "examples": "ORD-20240315-00012, uuid-...",
+        "related_fields": "customer_id, cart_id, invoice_id",
+        "compliance_notes": "",
+    },
+    {
+        "field_name": "order_status",
+        "domain": "commerce",
+        "sub_domain": "order",
+        "data_type": "ENUM / VARCHAR(50)",
+        "constraints": "NOT NULL, DEFAULT 'pending', INDEX",
+        "professional_description": (
+            "Represents the current fulfilment lifecycle state of a sales order, "
+            "transitioning through defined stages from placement to resolution. "
+            "Triggers downstream workflow automations including warehouse pick "
+            "lists, shipping label generation, customer notification events, and "
+            "revenue recognition entries in the ERP system."
+        ),
+        "examples": "pending, confirmed, processing, shipped, delivered, cancelled, refunded",
+        "related_fields": "payment_status, shipment_status, updated_at",
+        "compliance_notes": "",
+    },
+    {
+        "field_name": "grand_total",
+        "domain": "commerce",
+        "sub_domain": "order",
+        "data_type": "DECIMAL(15,4)",
+        "constraints": "NOT NULL, DEFAULT 0.0000",
+        "professional_description": (
+            "The final invoiced amount payable by the customer, aggregating "
+            "subtotal, applied taxes, shipping charges, and discounts. Stored in "
+            "the order's base currency at four decimal precision for multi-currency "
+            "compliance. This value is the authoritative figure for payment capture, "
+            "revenue reporting, and VAT/GST return submissions."
+        ),
+        "examples": "149.9900, 2399.0000",
+        "related_fields": "subtotal, tax_amount, shipping_amount, discount_amount, base_currency_code",
+        "compliance_notes": "Must align with payment gateway capture amount to prevent chargebacks.",
+    },
+
+    # ── Inventory ──────────────────────────────────────────────────────────
+    {
+        "field_name": "qty_on_hand",
+        "domain": "commerce",
+        "sub_domain": "inventory",
+        "data_type": "DECIMAL(12,4)",
+        "constraints": "NOT NULL, DEFAULT 0",
+        "professional_description": (
+            "The real-time physical stock quantity available at a given warehouse "
+            "or fulfilment location for a specific SKU. Updated via inventory "
+            "adjustment transactions, GRN receipts, and order reservation events. "
+            "Decimal precision supports fractional unit commodities (fabric, "
+            "chemicals). Serves as the source-of-truth for Available-to-Promise "
+            "calculations and low-stock alert thresholds."
+        ),
+        "examples": "150.0000, 0.7500",
+        "related_fields": "qty_reserved, qty_available, reorder_point, location_id",
+        "compliance_notes": "",
+    },
+
+    # ── Payment ────────────────────────────────────────────────────────────
+    {
+        "field_name": "payment_method_code",
+        "domain": "commerce",
+        "sub_domain": "payment",
+        "data_type": "VARCHAR(64)",
+        "constraints": "NOT NULL, INDEX",
+        "professional_description": (
+            "Machine-readable identifier for the payment instrument or gateway "
+            "used to settle an order transaction. Maps to payment provider "
+            "configurations for routing, fee calculation, and reconciliation "
+            "workflows. Values are defined in the payment method registry and "
+            "must align with PSP integration contracts."
+        ),
+        "examples": "stripe_card, paypal_express, bank_transfer, buy_now_pay_later",
+        "related_fields": "payment_status, transaction_id, gateway_response_code",
+        "compliance_notes": "PCI-DSS scope — no raw card data stored alongside this field.",
+    },
+    {
+        "field_name": "transaction_id",
+        "domain": "commerce",
+        "sub_domain": "payment",
+        "data_type": "VARCHAR(255)",
+        "constraints": "UNIQUE, NULLABLE, INDEX",
+        "professional_description": (
+            "The external reference identifier returned by the payment service "
+            "provider upon successful transaction authorisation or capture. "
+            "Essential for dispute resolution, chargeback management, and "
+            "automated reconciliation with bank settlement reports. Null until "
+            "a gateway response is received."
+        ),
+        "examples": "pi_3OqXXXLkdIwHu7ix, PAYID-ABC123",
+        "related_fields": "payment_method_code, order_id, gateway_response_code",
+        "compliance_notes": "Retain per PCI-DSS audit trail requirements (minimum 1 year).",
+    },
+
+    # ── Address / Shipping ─────────────────────────────────────────────────
+    {
+        "field_name": "shipping_address_id",
+        "domain": "commerce",
+        "sub_domain": "shipping",
+        "data_type": "BIGINT",
+        "constraints": "FOREIGN KEY → address.id, NOT NULL",
+        "professional_description": (
+            "Foreign key reference to the normalised address entity designated "
+            "as the delivery destination for an order shipment. Decouples address "
+            "data from order records enabling address reuse, address book "
+            "management, and carrier validation workflows. Snapshots of the "
+            "address at order time should be preserved separately for audit "
+            "compliance."
+        ),
+        "examples": "4821",
+        "related_fields": "billing_address_id, street, city, postal_code, country_code",
+        "compliance_notes": "GDPR — address constitutes personal data; apply retention policy.",
+    },
+    {
+        "field_name": "tracking_number",
+        "domain": "commerce",
+        "sub_domain": "shipping",
+        "data_type": "VARCHAR(100)",
+        "constraints": "NULLABLE, INDEX",
+        "professional_description": (
+            "Carrier-issued parcel tracking reference assigned upon shipment "
+            "dispatch. Enables end-to-end logistics visibility for warehouse "
+            "operations, customer self-service tracking portals, and carrier "
+            "SLA monitoring dashboards. Null prior to fulfilment dispatch; "
+            "populated via carrier API webhook or manual entry."
+        ),
+        "examples": "1Z999AA10123456784, 9400111899223397765906",
+        "related_fields": "carrier_code, shipment_id, shipped_at",
+        "compliance_notes": "",
+    },
+
+    # ── Promotions ─────────────────────────────────────────────────────────
+    {
+        "field_name": "coupon_code",
+        "domain": "commerce",
+        "sub_domain": "promotions",
+        "data_type": "VARCHAR(32)",
+        "constraints": "NULLABLE, INDEX",
+        "professional_description": (
+            "Merchant-issued alphanumeric voucher code entered by a customer "
+            "during checkout to activate a promotional pricing rule or discount "
+            "entitlement. Validated against the active promotion registry at "
+            "cart evaluation time, subject to usage limits, validity windows, "
+            "and customer segment eligibility criteria."
+        ),
+        "examples": "SUMMER20, NEWCUST10",
+        "related_fields": "discount_amount, promotion_id, usage_count",
+        "compliance_notes": "",
+    },
+
+    # ── Audit / Meta ───────────────────────────────────────────────────────
+    {
+        "field_name": "created_at",
+        "domain": "commerce",
+        "sub_domain": "audit",
+        "data_type": "TIMESTAMP / DATETIME",
+        "constraints": "NOT NULL, DEFAULT CURRENT_TIMESTAMP",
+        "professional_description": (
+            "UTC timestamp automatically recorded at row insertion denoting "
+            "the precise moment the entity was created within the system. "
+            "Immutable post-creation and used as the authoritative reference "
+            "for chronological reporting, SLA calculations, data retention "
+            "policy enforcement, and audit trail reconstruction."
+        ),
+        "examples": "2024-03-15 14:22:07 UTC",
+        "related_fields": "updated_at, created_by, version",
+        "compliance_notes": "Retain per applicable data retention schedule.",
+    },
+    {
+        "field_name": "updated_at",
+        "domain": "commerce",
+        "sub_domain": "audit",
+        "data_type": "TIMESTAMP / DATETIME",
+        "constraints": "NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE",
+        "professional_description": (
+            "UTC timestamp automatically refreshed on every UPDATE operation, "
+            "capturing the last modification time of the record. Fundamental "
+            "for incremental ETL synchronisation strategies, optimistic concurrency "
+            "control, cache invalidation triggers, and change-data-capture (CDC) "
+            "pipelines feeding data warehouses or event buses."
+        ),
+        "examples": "2024-03-16 09:05:33 UTC",
+        "related_fields": "created_at, updated_by, version",
+        "compliance_notes": "",
+    },
+    {
+        "field_name": "is_deleted",
+        "domain": "commerce",
+        "sub_domain": "audit",
+        "data_type": "TINYINT(1) / BOOLEAN",
+        "constraints": "NOT NULL, DEFAULT 0, INDEX",
+        "professional_description": (
+            "Soft-delete flag implementing logical deletion semantics to preserve "
+            "referential integrity and historical audit trails while hiding records "
+            "from active application queries. All standard repository queries must "
+            "filter on is_deleted = 0. Physical deletion is deferred to scheduled "
+            "purge jobs governed by the data retention policy."
+        ),
+        "examples": "0 (active), 1 (deleted)",
+        "related_fields": "deleted_at, deleted_by",
+        "compliance_notes": "GDPR erasure: set flag and anonymise PII fields; do not hard-delete.",
+    },
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _validate_env() -> None:
+    """Abort early if required environment variables are missing."""
+    missing = [v for v in ("AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_ADMIN_KEY") if not os.getenv(v)]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required environment variables: {', '.join(missing)}\n"
+            "Copy .env.example to .env and fill in your credentials."
+        )
+
+
+def _get_embedding(text: str, client: "AzureOpenAI") -> list[float]:
+    """Generate an embedding vector for the given text."""
+    response = client.embeddings.create(input=text, model=EMBEDDING_DEPLOYMENT)
+    return response.data[0].embedding
+
+
+def _load_external_documents(directory: Path) -> list[dict]:
+    """
+    Load supplemental knowledge base entries from /knowledge_base directory.
+    Supports .json files (list of dicts) and .txt files (one entry per paragraph).
+    """
+    docs = []
+    if not directory.exists():
+        log.info("No external knowledge_base directory found — using built-in corpus only.")
+        return docs
+
+    for file in directory.iterdir():
+        if file.suffix == ".json":
+            try:
+                with open(file, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    docs.extend(data)
+                    log.info("  Loaded %d docs from %s", len(data), file.name)
+            except Exception as exc:
+                log.warning("  Skipping %s: %s", file.name, exc)
+
+        elif file.suffix == ".txt":
+            with open(file, encoding="utf-8") as f:
+                paragraphs = [p.strip() for p in f.read().split("\n\n") if p.strip()]
+            for i, para in enumerate(paragraphs):
+                docs.append({
+                    "field_name": f"{file.stem}_entry_{i}",
+                    "domain": "commerce",
+                    "sub_domain": "general",
+                    "data_type": "",
+                    "constraints": "",
+                    "professional_description": para,
+                    "examples": "",
+                    "related_fields": "",
+                    "compliance_notes": "",
+                })
+            log.info("  Loaded %d text paragraphs from %s", len(paragraphs), file.name)
+
+    return docs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — CREATE INDEX
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_index(index_client: SearchIndexClient) -> None:
+    """
+    Define and create the Azure AI Search index with:
+    - Standard searchable / filterable fields
+    - Semantic search configuration
+    - Optional vector search profile (when embeddings are available)
+    """
+    log.info("━━ Step 1: Creating index '%s' ━━", INDEX_NAME)
+
+    fields = [
+        SimpleField(name="id",            type=SearchFieldDataType.String, key=True, filterable=True),
+        SearchableField(name="field_name",   type=SearchFieldDataType.String, filterable=True, sortable=True),
+        SimpleField(name="domain",           type=SearchFieldDataType.String, filterable=True, facetable=True),
+        SimpleField(name="sub_domain",       type=SearchFieldDataType.String, filterable=True, facetable=True),
+        SearchableField(name="professional_description", type=SearchFieldDataType.String, analyzer_name="en.microsoft"),
+        SimpleField(name="data_type",        type=SearchFieldDataType.String, filterable=True),
+        SearchableField(name="constraints",  type=SearchFieldDataType.String),
+        SearchableField(name="examples",     type=SearchFieldDataType.String),
+        SearchableField(name="related_fields", type=SearchFieldDataType.String),
+        SearchableField(name="compliance_notes", type=SearchFieldDataType.String),
+    ]
+
+    # ── Vector field (only added when embeddings are configured) ────────────
+    vector_search = None
+    if USE_VECTOR_SEARCH:
+        fields.append(
+            SearchField(
+                name="description_vector",
+                type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                searchable=True,
+                vector_search_dimensions=EMBEDDING_DIMENSIONS,
+                vector_search_profile_name="hnsw-profile",
+            )
+        )
+        vector_search = VectorSearch(
+            algorithms=[HnswAlgorithmConfiguration(name="hnsw-algo")],
+            profiles=[VectorSearchProfile(name="hnsw-profile", algorithm_configuration_name="hnsw-algo")],
+        )
+        log.info("  Vector search enabled (dimensions=%d)", EMBEDDING_DIMENSIONS)
+
+    # ── Semantic configuration ───────────────────────────────────────────────
+    semantic_config = SemanticConfiguration(
+        name="commerce-semantic",
+        prioritized_fields=SemanticPrioritizedFields(
+            title_field=SemanticField(field_name="field_name"),
+            content_fields=[SemanticField(field_name="professional_description")],
+            keywords_fields=[
+                SemanticField(field_name="domain"),
+                SemanticField(field_name="sub_domain"),
+                SemanticField(field_name="constraints"),
+            ],
+        ),
+    )
+
+    index = SearchIndex(
+        name=INDEX_NAME,
+        fields=fields,
+        semantic_search=SemanticSearch(configurations=[semantic_config]),
+        vector_search=vector_search,
+    )
+
+    try:
+        index_client.create_index(index)
+        log.info("  ✓ Index created successfully")
+    except ResourceExistsError:
+        log.warning("  ⚠  Index already exists — recreating with latest schema")
+        index_client.delete_index(INDEX_NAME)
+        time.sleep(2)
+        index_client.create_index(index)
+        log.info("  ✓ Index recreated")
+    except HttpResponseError as exc:
+        log.error("  ✗ Failed to create index: %s", exc.message)
+        raise
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — PREPARE DOCUMENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def prepare_documents(
+    raw_docs: list[dict],
+    openai_client: Optional["AzureOpenAI"] = None,
+) -> list[dict]:
+    """
+    Assign unique IDs and optionally generate embedding vectors
+    for each knowledge base entry.
+    """
+    log.info("━━ Step 2: Preparing %d documents ━━", len(raw_docs))
+    prepared = []
+
+    for doc in tqdm(raw_docs, desc="  Preparing", unit="doc"):
+        entry = {
+            "id":                       str(uuid.uuid4()),
+            "field_name":               doc.get("field_name", ""),
+            "domain":                   doc.get("domain", "commerce"),
+            "sub_domain":               doc.get("sub_domain", "general"),
+            "professional_description": doc.get("professional_description", ""),
+            "data_type":                doc.get("data_type", ""),
+            "constraints":              doc.get("constraints", ""),
+            "examples":                 doc.get("examples", ""),
+            "related_fields":           doc.get("related_fields", ""),
+            "compliance_notes":         doc.get("compliance_notes", ""),
+        }
+
+        if USE_VECTOR_SEARCH and openai_client:
+            embed_text = (
+                f"{entry['field_name']} {entry['professional_description']} "
+                f"{entry['constraints']} {entry['related_fields']}"
+            )
+            try:
+                entry["description_vector"] = _get_embedding(embed_text, openai_client)
+            except Exception as exc:
+                log.warning("  Embedding failed for '%s': %s", entry["field_name"], exc)
+
+        prepared.append(entry)
+
+    log.info("  ✓ %d documents prepared", len(prepared))
+    return prepared
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — UPLOAD DOCUMENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def upload_documents(search_client: SearchClient, documents: list[dict], batch_size: int = 50) -> None:
+    """
+    Upload documents to the index in batches with retry logic.
+    """
+    log.info("━━ Step 3: Uploading %d documents (batch_size=%d) ━━", len(documents), batch_size)
+    total_uploaded = 0
+
+    for i in range(0, len(documents), batch_size):
+        batch = documents[i : i + batch_size]
+        attempt = 0
+        while attempt < 3:
+            try:
+                result = search_client.upload_documents(documents=batch)
+                failed = [r for r in result if not r.succeeded]
+                if failed:
+                    log.warning("  ⚠  %d documents failed in batch %d", len(failed), i // batch_size + 1)
+                    for f in failed:
+                        log.warning("     key=%s  error=%s", f.key, f.error_message)
+                total_uploaded += len(batch) - len(failed)
+                break
+            except HttpResponseError as exc:
+                attempt += 1
+                log.warning("  Batch %d upload failed (attempt %d/3): %s", i // batch_size + 1, attempt, exc.message)
+                time.sleep(2 ** attempt)
+
+    log.info("  ✓ %d / %d documents uploaded successfully", total_uploaded, len(documents))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — VERIFY INDEX
+# ══════════════════════════════════════════════════════════════════════════════
+
+def verify_index(search_client: SearchClient) -> None:
+    """
+    Run test queries against the populated index to confirm retrieval quality.
+    """
+    log.info("━━ Step 4: Verifying index ━━")
+
+    test_queries = [
+        ("customer email unique identifier", "customer"),
+        ("order total payment amount", "order"),
+        ("stock quantity inventory warehouse", "inventory"),
+    ]
+
+    for query_text, expected_domain in test_queries:
+        try:
+            results = list(search_client.search(
+                search_text=query_text,
+                query_type=QueryType.SEMANTIC,
+                semantic_configuration_name="commerce-semantic",
+                top=2,
+                select=["field_name", "domain", "professional_description"],
+            ))
+
+            if results:
+                top = results[0]
+                snippet = top["professional_description"][:80] + "..."
+                log.info(
+                    "  ✓ Query: '%-40s' → %s (%s) — %s",
+                    query_text, top["field_name"], top["domain"], snippet,
+                )
+            else:
+                log.warning("  ⚠  No results for query: '%s'", query_text)
+
+        except Exception as exc:
+            log.warning("  ⚠  Verification query failed: %s", exc)
+
+    log.info("  ✓ Verification complete")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5 — RAG QUERY FUNCTION (ready to integrate into your DDL system)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def retrieve_context_for_column(
+    field_name: str,
+    table_name: str,
+    search_client: SearchClient,
+    top_k: int = 3,
+) -> str:
+    """
+    Retrieve the most relevant professional descriptions from the index
+    for a given column name + table context.
+
+    Returns a formatted context string ready to inject into your GPT prompt.
+    """
+    query = f"{field_name} {table_name}"
+
+    results = list(search_client.search(
+        search_text=query,
+        query_type=QueryType.SEMANTIC,
+        semantic_configuration_name="commerce-semantic",
+        top=top_k,
+        select=["field_name", "professional_description", "constraints",
+                "related_fields", "compliance_notes", "domain"],
+    ))
+
+    if not results:
+        return ""
+
+    context_parts = []
+    for r in results:
+        context_parts.append(
+            f"Field: {r['field_name']} [{r['domain']}]\n"
+            f"Description: {r['professional_description']}\n"
+            f"Constraints: {r['constraints']}\n"
+            f"Related: {r['related_fields']}"
+        )
+    return "\n\n---\n\n".join(context_parts)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRYPOINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    print("\n" + "═" * 60)
+    print("  Azure AI Search — Commerce RAG Index Setup")
+    print("═" * 60 + "\n")
+
+    _validate_env()
+
+    credential    = AzureKeyCredential(AZURE_SEARCH_ADMIN_KEY)
+    index_client  = SearchIndexClient(endpoint=AZURE_SEARCH_ENDPOINT, credential=credential)
+    search_client = SearchClient(endpoint=AZURE_SEARCH_ENDPOINT, index_name=INDEX_NAME, credential=credential)
+
+    openai_client = None
+    if USE_VECTOR_SEARCH:
+        openai_client = AzureOpenAI(
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            api_key=AZURE_OPENAI_KEY,
+            api_version=AZURE_OPENAI_API_VER,
+        )
+        log.info("Azure OpenAI client initialised for embeddings")
+
+    # ── Merge built-in + external knowledge base ─────────────────────────
+    external_docs = _load_external_documents(KNOWLEDGE_BASE_DIR)
+    all_docs      = COMMERCE_KNOWLEDGE_BASE + external_docs
+    log.info("Total knowledge base entries: %d (%d built-in + %d external)",
+             len(all_docs), len(COMMERCE_KNOWLEDGE_BASE), len(external_docs))
+
+    # ── Run pipeline ──────────────────────────────────────────────────────
+    create_index(index_client)
+    time.sleep(2)   # allow index to propagate
+
+    documents = prepare_documents(all_docs, openai_client)
+    upload_documents(search_client, documents)
+    time.sleep(3)   # allow indexer to process
+
+    verify_index(search_client)
+
+    print("\n" + "═" * 60)
+    print("  ✅  Setup complete!")
+    print(f"  Index : {INDEX_NAME}")
+    print(f"  Docs  : {len(documents)} entries indexed")
+    print(f"  Vector: {'enabled' if USE_VECTOR_SEARCH else 'disabled (set AZURE_OPENAI_* to enable)'}")
+    print("═" * 60 + "\n")
+
+
+if __name__ == "__main__":
+    main()
